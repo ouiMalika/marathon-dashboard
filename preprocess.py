@@ -1,64 +1,91 @@
-"""
-preprocess.py
----------------
-Read the Boston Marathon CSV (wide format, one row per runner with split columns)
-and produce a long-format, time-ordered events CSV that the producer can replay.
+"""Convert raw marathon results into a time-ordered event stream.
 
-Input : data/results.csv  (Kaggle rojour/boston-results, e.g. marathon_results_2015.csv)
-Output: data/events.csv   (one row per runner-checkpoint, sorted by elapsed_seconds)
+Reads a Boston Marathon results CSV in its original wide format (one row per
+runner with one column per checkpoint split) and writes a long-format CSV
+containing one row per runner-checkpoint, sorted by elapsed time. The output
+is consumed by the producer, which replays it into Kafka.
+
+Input:  data/results.csv  (Kaggle dataset rojour/boston-results)
+Output: data/events.csv
 """
 import pandas as pd
+
 from config import CHECKPOINTS, RACE_ID
 
-INPUT = "data/results.csv"
-OUTPUT = "data/events.csv"
+INPUT_PATH = "data/results.csv"
+OUTPUT_PATH = "data/events.csv"
 
 
-def parse_split(s: str) -> int | None:
-    """'1:23:45' or '0:05:12' -> seconds. Missing/invalid -> None."""
-    if not isinstance(s, str) or s.strip() in ("", "-"):
+def parse_split(value) -> int | None:
+    """Convert a split string in 'H:MM:SS' format to a number of seconds.
+
+    Returns None for missing, blank, or malformed values.
+    """
+    if not isinstance(value, str) or value.strip() in ("", "-"):
         return None
     try:
-        h, m, sec = s.split(":")
-        return int(h) * 3600 + int(m) * 60 + int(sec)
+        hours, minutes, seconds = value.split(":")
+        return int(hours) * 3600 + int(minutes) * 60 + int(seconds)
     except ValueError:
         return None
 
 
+def find_column(df: pd.DataFrame, candidates: list[str]) -> str:
+    """Return the first column name from candidates that exists in df.
+
+    Raises KeyError if none of the candidates are present.
+    """
+    for name in candidates:
+        if name in df.columns:
+            return name
+    raise KeyError(
+        f"None of the expected columns {candidates} were found in the input file."
+    )
+
+
 def main():
-    df = pd.read_csv(INPUT)
-    # Kaggle file has either 'Bib' or 'bib' depending on year; normalize.
+    """Read the input CSV, melt it into long format, and write the output CSV."""
+    df = pd.read_csv(INPUT_PATH)
     df.columns = [c.strip() for c in df.columns]
-    bib_col = "Bib" if "Bib" in df.columns else "bib"
-    name_col = "Name" if "Name" in df.columns else "name"
-    age_col = "Age" if "Age" in df.columns else "age"
-    gender_col = "M/F" if "M/F" in df.columns else "gender"
+
+    # Column names vary slightly between years of the Boston dataset
+    bib_col = find_column(df, ["Bib", "bib"])
+    name_col = find_column(df, ["Name", "name"])
+    age_col = find_column(df, ["Age", "age"])
+    gender_col = find_column(df, ["M/F", "gender"])
 
     rows = []
-    for _, r in df.iterrows():
-        for split_col, km in CHECKPOINTS.items():
-            if split_col not in df.columns:
+    for _, runner in df.iterrows():
+        for checkpoint_label, checkpoint_km in CHECKPOINTS.items():
+            if checkpoint_label not in df.columns:
                 continue
-            secs = parse_split(r[split_col])
-            if secs is None or secs <= 0:
+            elapsed = parse_split(runner[checkpoint_label])
+            if elapsed is None or elapsed <= 0:
                 continue
             rows.append({
                 "race_id": RACE_ID,
-                "runner_id": str(r[bib_col]),
-                "runner_name": str(r[name_col]).strip(),
-                "age": int(r[age_col]) if pd.notna(r[age_col]) else None,
-                "gender": str(r[gender_col]),
-                "checkpoint_label": split_col,
-                "checkpoint_km": km,
-                "elapsed_seconds": secs,
+                "runner_id": str(runner[bib_col]),
+                "runner_name": str(runner[name_col]).strip(),
+                "age": int(runner[age_col]) if pd.notna(runner[age_col]) else None,
+                "gender": str(runner[gender_col]),
+                "checkpoint_label": checkpoint_label,
+                "checkpoint_km": checkpoint_km,
+                "elapsed_seconds": elapsed,
             })
 
-    events = pd.DataFrame(rows).sort_values("elapsed_seconds").reset_index(drop=True)
-    events.to_csv(OUTPUT, index=False)
-    print(f"Wrote {len(events):,} events to {OUTPUT}")
-    print(f"Runners: {events['runner_id'].nunique():,}")
-    print(f"Race duration (fastest→slowest): "
-          f"{events['elapsed_seconds'].min()}s → {events['elapsed_seconds'].max()}s")
+    events = (
+        pd.DataFrame(rows)
+        .sort_values("elapsed_seconds")
+        .reset_index(drop=True)
+    )
+    events.to_csv(OUTPUT_PATH, index=False)
+
+    print(f"Wrote {len(events):,} events to {OUTPUT_PATH}")
+    print(f"Unique runners: {events['runner_id'].nunique():,}")
+    print(
+        f"Elapsed time range: "
+        f"{events['elapsed_seconds'].min()}s to {events['elapsed_seconds'].max()}s"
+    )
 
 
 if __name__ == "__main__":

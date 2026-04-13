@@ -1,66 +1,86 @@
-"""
-producer.py
------------
-Replay preprocessed events into Kafka in simulated real time.
+"""Replay preprocessed marathon events into Kafka in simulated real time.
 
-- Reads data/events.csv (already sorted by elapsed_seconds).
-- Sleeps between events proportional to the elapsed-time gap, divided by SPEEDUP.
-- Keys messages by race_id so all events for one race land on the same partition,
-  preserving checkpoint ordering (crucial for leaderboard correctness).
+Reads the time-sorted events CSV produced by preprocess.py and publishes each
+event to a Kafka topic. Between events the script sleeps for an interval
+proportional to the gap in elapsed race time, divided by the SPEEDUP factor
+in config, so the stream behaves like a live race feed compressed (or
+expanded) by a chosen factor.
+
+Each message is keyed by race_id, which causes all events belonging to the
+same race to land on the same partition and be delivered in the order they
+were sent.
 """
 import json
 import time
+
 import pandas as pd
 from kafka import KafkaProducer
+
 from config import KAFKA_BOOTSTRAP, TOPIC, RACE_START_EPOCH, SPEEDUP
 
-EVENTS_CSV = "data/events.csv"
+EVENTS_PATH = "data/events.csv"
+
+# How often to print a progress line, measured in events sent
+PROGRESS_INTERVAL = 1000
+
+
+def build_event(row, replay_timestamp: float) -> dict:
+    """Convert one CSV row into the event dictionary published to Kafka."""
+    elapsed = int(row["elapsed_seconds"])
+    return {
+        "race_id": row["race_id"],
+        "runner_id": str(row["runner_id"]),
+        "runner_name": row["runner_name"],
+        "age": None if pd.isna(row["age"]) else int(row["age"]),
+        "gender": row["gender"],
+        "checkpoint_label": row["checkpoint_label"],
+        "checkpoint_km": float(row["checkpoint_km"]),
+        "elapsed_seconds": elapsed,
+        "event_timestamp": RACE_START_EPOCH + elapsed,
+        "replay_timestamp": replay_timestamp,
+    }
 
 
 def main():
-    df = pd.read_csv(EVENTS_CSV)
-    print(f"Loaded {len(df):,} events. Replaying at {SPEEDUP}x speed.")
+    """Load the events file and stream every row into Kafka."""
+    events = pd.read_csv(EVENTS_PATH)
+    print(f"Loaded {len(events):,} events. Replaying at {SPEEDUP}x speed.")
 
     producer = KafkaProducer(
         bootstrap_servers=KAFKA_BOOTSTRAP,
         value_serializer=lambda v: json.dumps(v).encode("utf-8"),
         key_serializer=lambda k: k.encode("utf-8") if k else None,
-        acks="all",           # wait for leader ack — safer, no throughput concern here
-        linger_ms=5,          # tiny batching window
+        acks="all",
+        linger_ms=5,
     )
 
-    prev_elapsed = 0
+    previous_elapsed = 0
     sent = 0
-    start_wall = time.time()
+    start_wall_time = time.time()
 
-    for _, row in df.iterrows():
-        gap = max(0, int(row["elapsed_seconds"]) - prev_elapsed)
+    for _, row in events.iterrows():
+        elapsed = int(row["elapsed_seconds"])
+        gap = max(0, elapsed - previous_elapsed)
         if gap:
             time.sleep(gap / SPEEDUP)
-        prev_elapsed = int(row["elapsed_seconds"])
+        previous_elapsed = elapsed
 
-        event = {
-            "race_id": row["race_id"],
-            "runner_id": str(row["runner_id"]),
-            "runner_name": row["runner_name"],
-            "age": None if pd.isna(row["age"]) else int(row["age"]),
-            "gender": row["gender"],
-            "checkpoint_label": row["checkpoint_label"],
-            "checkpoint_km": float(row["checkpoint_km"]),
-            "elapsed_seconds": int(row["elapsed_seconds"]),
-            "event_timestamp": RACE_START_EPOCH + int(row["elapsed_seconds"]),
-            "replay_timestamp": time.time(),
-        }
-
+        event = build_event(row, replay_timestamp=time.time())
         producer.send(TOPIC, key=event["race_id"], value=event)
         sent += 1
-        if sent % 1000 == 0:
-            rate = sent / (time.time() - start_wall)
-            print(f"  sent {sent:,} events ({rate:.0f}/s, race_clock={prev_elapsed}s)")
+
+        if sent % PROGRESS_INTERVAL == 0:
+            rate = sent / (time.time() - start_wall_time)
+            print(
+                f"  sent {sent:,} events "
+                f"({rate:.0f}/s, race_clock={previous_elapsed}s)"
+            )
 
     producer.flush()
     producer.close()
-    print(f"Done. Sent {sent:,} events in {time.time() - start_wall:.1f}s.")
+
+    duration = time.time() - start_wall_time
+    print(f"Done. Sent {sent:,} events in {duration:.1f}s.")
 
 
 if __name__ == "__main__":
