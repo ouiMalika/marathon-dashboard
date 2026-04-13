@@ -8,7 +8,14 @@ NUM_PARTITIONS = 3
 # Local SQLite database file
 DB_PATH = "marathon.db"
 
-# Race identifier and synthetic race-start epoch used for event timestamps
+# Race identifier mapped to the input CSV path for each race year
+RACES = {
+    "boston_2015": "data/results_2015.csv",
+    "boston_2016": "data/results_2016.csv",
+    "boston_2017": "data/results_2017.csv",
+}
+
+# Default race ID used by single-race contexts (heartbeat display, fallbacks)
 RACE_ID = "boston_2015"
 RACE_START_EPOCH = 1_700_000_000
 

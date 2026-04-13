@@ -10,7 +10,7 @@ Output: data/events.csv
 """
 import pandas as pd
 
-from config import CHECKPOINTS, RACE_ID
+from config import CHECKPOINTS, RACES
 
 INPUT_PATH = "data/results.csv"
 OUTPUT_PATH = "data/events.csv"
@@ -44,43 +44,49 @@ def find_column(df: pd.DataFrame, candidates: list[str]) -> str:
 
 
 def main():
-    """Read the input CSV, melt it into long format, and write the output CSV."""
-    df = pd.read_csv(INPUT_PATH)
-    df.columns = [c.strip() for c in df.columns]
+    """Read each race's CSV, melt it into long format, and write the combined output."""
+    all_rows = []
 
-    # Column names vary slightly between years of the Boston dataset
-    bib_col = find_column(df, ["Bib", "bib"])
-    name_col = find_column(df, ["Name", "name"])
-    age_col = find_column(df, ["Age", "age"])
-    gender_col = find_column(df, ["M/F", "gender"])
+    for race_id, input_path in RACES.items():
+        print(f"Reading {race_id} from {input_path}")
+        df = pd.read_csv(input_path)
+        df.columns = [c.strip() for c in df.columns]
 
-    rows = []
-    for _, runner in df.iterrows():
-        for checkpoint_label, checkpoint_km in CHECKPOINTS.items():
-            if checkpoint_label not in df.columns:
-                continue
-            elapsed = parse_split(runner[checkpoint_label])
-            if elapsed is None or elapsed <= 0:
-                continue
-            rows.append({
-                "race_id": RACE_ID,
-                "runner_id": str(runner[bib_col]),
-                "runner_name": str(runner[name_col]).strip(),
-                "age": int(runner[age_col]) if pd.notna(runner[age_col]) else None,
-                "gender": str(runner[gender_col]),
-                "checkpoint_label": checkpoint_label,
-                "checkpoint_km": checkpoint_km,
-                "elapsed_seconds": elapsed,
-            })
+        bib_col = find_column(df, ["Bib", "bib"])
+        name_col = find_column(df, ["Name", "name"])
+        age_col = find_column(df, ["Age", "age"])
+        gender_col = find_column(df, ["M/F", "gender"])
+
+        race_rows = 0
+        for _, runner in df.iterrows():
+            for checkpoint_label, checkpoint_km in CHECKPOINTS.items():
+                if checkpoint_label not in df.columns:
+                    continue
+                elapsed = parse_split(runner[checkpoint_label])
+                if elapsed is None or elapsed <= 0:
+                    continue
+                all_rows.append({
+                    "race_id": race_id,
+                    "runner_id": str(runner[bib_col]),
+                    "runner_name": str(runner[name_col]).strip(),
+                    "age": int(runner[age_col]) if pd.notna(runner[age_col]) else None,
+                    "gender": str(runner[gender_col]),
+                    "checkpoint_label": checkpoint_label,
+                    "checkpoint_km": checkpoint_km,
+                    "elapsed_seconds": elapsed,
+                })
+                race_rows += 1
+        print(f"  {race_rows:,} events from {race_id}")
 
     events = (
-        pd.DataFrame(rows)
+        pd.DataFrame(all_rows)
         .sort_values("elapsed_seconds")
         .reset_index(drop=True)
     )
     events.to_csv(OUTPUT_PATH, index=False)
 
-    print(f"Wrote {len(events):,} events to {OUTPUT_PATH}")
+    print(f"\nWrote {len(events):,} total events to {OUTPUT_PATH}")
+    print(f"Races: {events['race_id'].nunique()}")
     print(f"Unique runners: {events['runner_id'].nunique():,}")
     print(
         f"Elapsed time range: "

@@ -1,5 +1,4 @@
-"""
-Marathon analytics streaming consumer.
+"""Marathon analytics streaming consumer.
 
 Reads runner checkpoint events from a Kafka topic, maintains race aggregates
 in memory, and persists both the raw event log and the aggregates to SQLite.
@@ -16,6 +15,9 @@ Tables written:
                          half was faster than, equal to, or slower than their
                          first half
   cohort_pace            average pace per segment grouped by runner cohort
+  finish_time            distribution statistics of finish times grouped by
+                         race and cohort, used for year-over-year comparison
+  field_size             number of distinct runners observed per race
   quality_issues         events flagged as physically implausible
 
 Duplicate events are ignored on raw_events via a uniqueness constraint, and
@@ -54,8 +56,14 @@ SECOND_SPAN_KM = 40.0 - FIRST_HALF_KM
 # ---------- Database setup ----------
 
 def init_db():
-    """Open a connection to the SQLite database and create any missing tables."""
+    """Open a connection to the SQLite database and create any missing tables.
+
+    Enables Write-Ahead Logging so the dashboard can read while the consumer
+    writes without lock contention.
+    """
     conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS raw_events (
         race_id TEXT, runner_id TEXT, runner_name TEXT,
@@ -103,11 +111,25 @@ def init_db():
         PRIMARY KEY (race_id, cohort, segment)
     );
 
+    CREATE TABLE IF NOT EXISTS finish_time (
+        race_id TEXT, cohort TEXT,
+        median_seconds REAL, mean_seconds REAL,
+        runner_count INTEGER, updated_at REAL,
+        PRIMARY KEY (race_id, cohort)
+    );
+
+    CREATE TABLE IF NOT EXISTS field_size (
+        race_id TEXT,
+        runner_count INTEGER, updated_at REAL,
+        PRIMARY KEY (race_id)
+    );
+
     CREATE TABLE IF NOT EXISTS quality_issues (
         race_id TEXT, runner_id TEXT, runner_name TEXT,
         segment TEXT, pace_sec_per_km REAL, reason TEXT, detected_at REAL
     );
     CREATE INDEX IF NOT EXISTS idx_issues_reason ON quality_issues(reason);
+    CREATE INDEX IF NOT EXISTS idx_issues_race ON quality_issues(race_id);
     """)
     conn.commit()
     return conn
@@ -120,6 +142,18 @@ def cohort_for_pace(pace_sec_per_km: float):
         if lo <= pace_sec_per_km < hi:
             return name
     return None
+
+
+def median(values):
+    """Return the median of a sorted-or-unsorted list of numbers, or None if empty."""
+    if not values:
+        return None
+    s = sorted(values)
+    n = len(s)
+    mid = n // 2
+    if n % 2 == 0:
+        return (s[mid - 1] + s[mid]) / 2
+    return s[mid]
 
 
 # ---------- In-memory state ----------
@@ -143,7 +177,7 @@ class State:
             lambda: deque(maxlen=PACE_ROLLING_N)
         )
 
-        # All splits seen so far for each runner, keyed by runner id
+        # All splits seen so far for each runner, keyed by (race_id, runner_id)
         self.runner_splits = {}
 
         # Total runners past each checkpoint, keyed by (race, checkpoint label)
@@ -153,10 +187,15 @@ class State:
         self.pace_ratio_class = {}
         self.pace_ratio_counts = defaultdict(int)
 
-        # Cohort assigned to each runner at their 5K split, plus the running
-        # sum and count used to compute average pace per (cohort, segment)
+        # Cohort assigned to each runner at their 5K split, keyed by (race, runner)
         self.runner_cohort = {}
         self.cohort_pace_agg = defaultdict(lambda: [0.0, 0])
+
+        # Finish times per (race, cohort) for median/mean computation
+        self.finish_times = defaultdict(list)
+
+        # Set of distinct runner ids seen per race, for field size
+        self.race_runners = defaultdict(set)
 
         # Anomalies waiting to be written, plus a running total that survives flushes
         self.pending_issues = []
@@ -169,6 +208,9 @@ class State:
         label = ev["checkpoint_label"]
         km = ev["checkpoint_km"]
         elapsed = ev["elapsed_seconds"]
+
+        # Track distinct runners seen per race
+        self.race_runners[race].add(rid)
 
         # Update the fastest runner seen at this checkpoint
         lb_key = (race, label)
@@ -190,10 +232,9 @@ class State:
         # Increment the total number of runners past this checkpoint
         self.completion[(race, label)] += 1
 
-        # Compute this runner's pace for the segment ending at this checkpoint.
-        # The result is reused below for the rolling average, the cohort
-        # aggregation, and anomaly detection.
-        splits = self.runner_splits.setdefault(rid, {})
+        # Compute this runner's pace for the segment ending at this checkpoint
+        runner_key = (race, rid)
+        splits = self.runner_splits.setdefault(runner_key, {})
         idx = SEGMENT_ORDER.index(label)
 
         segment_pace = None
@@ -232,28 +273,28 @@ class State:
             first_5k_pace = elapsed / CHECKPOINTS["5K"]
             cohort = cohort_for_pace(first_5k_pace)
             if cohort is not None:
-                self.runner_cohort[rid] = cohort
+                self.runner_cohort[runner_key] = cohort
 
         # Add this segment's pace to its cohort's running average, but only if
         # the pace is within the plausible range so anomalies do not skew it
         if segment_pace is not None and segment_name is not None:
-            cohort = self.runner_cohort.get(rid)
+            cohort = self.runner_cohort.get(runner_key)
             if cohort is not None and (
                 ANOMALY_FAST_PACE_SEC_PER_KM
                 <= segment_pace
                 <= ANOMALY_SLOW_PACE_SEC_PER_KM
             ):
-                agg = self.cohort_pace_agg[(cohort, segment_name)]
+                agg = self.cohort_pace_agg[(race, cohort, segment_name)]
                 agg[0] += segment_pace
                 agg[1] += 1
 
         # Store this split so later checkpoints can compute their own segments
         splits[label] = elapsed
 
-        # Once a runner reaches 40K, compare their first-half pace to their
-        # second-span pace and classify the result. Each runner is classified
-        # only once.
-        if label == "40K" and rid not in self.pace_ratio_class:
+        # Once a runner reaches 40K, classify pace ratio and record finish-time
+        # aggregates for this runner's (race, cohort) bucket. Each runner is
+        # processed only once.
+        if label == "40K" and runner_key not in self.pace_ratio_class:
             first_half_elapsed = splits.get("Half")
             if first_half_elapsed is not None and first_half_elapsed > 0:
                 first_half_pace = first_half_elapsed / FIRST_HALF_KM
@@ -269,8 +310,12 @@ class State:
                     else:
                         category = "slower_second"
 
-                    self.pace_ratio_class[rid] = category
-                    self.pace_ratio_counts[category] += 1
+                    self.pace_ratio_class[runner_key] = category
+                    self.pace_ratio_counts[(race, category)] += 1
+
+                    cohort = self.runner_cohort.get(runner_key)
+                    if cohort is not None:
+                        self.finish_times[(race, cohort)].append(elapsed)
 
 
 # ---------- Database flush ----------
@@ -323,15 +368,15 @@ def flush(conn, state: State):
                 updated_at = excluded.updated_at
         """, (race, label, km, count, now))
 
-    for category, count in state.pace_ratio_counts.items():
+    for (race, category), count in state.pace_ratio_counts.items():
         c.execute("""
             INSERT INTO pace_ratio VALUES (?,?,?,?)
             ON CONFLICT(race_id, category) DO UPDATE SET
                 runner_count = excluded.runner_count,
                 updated_at = excluded.updated_at
-        """, (RACE_ID, category, count, now))
+        """, (race, category, count, now))
 
-    for (cohort, segment), (total, n) in state.cohort_pace_agg.items():
+    for (race, cohort, segment), (total, n) in state.cohort_pace_agg.items():
         if n == 0:
             continue
         avg = total / n
@@ -341,7 +386,29 @@ def flush(conn, state: State):
                 avg_pace_sec_per_km = excluded.avg_pace_sec_per_km,
                 runner_count = excluded.runner_count,
                 updated_at = excluded.updated_at
-        """, (RACE_ID, cohort, segment, avg, n, now))
+        """, (race, cohort, segment, avg, n, now))
+
+    for (race, cohort), times in state.finish_times.items():
+        if not times:
+            continue
+        med = median(times)
+        mean = sum(times) / len(times)
+        c.execute("""
+            INSERT INTO finish_time VALUES (?,?,?,?,?,?)
+            ON CONFLICT(race_id, cohort) DO UPDATE SET
+                median_seconds = excluded.median_seconds,
+                mean_seconds = excluded.mean_seconds,
+                runner_count = excluded.runner_count,
+                updated_at = excluded.updated_at
+        """, (race, cohort, med, mean, len(times), now))
+
+    for race, runner_set in state.race_runners.items():
+        c.execute("""
+            INSERT INTO field_size VALUES (?,?,?)
+            ON CONFLICT(race_id) DO UPDATE SET
+                runner_count = excluded.runner_count,
+                updated_at = excluded.updated_at
+        """, (race, len(runner_set), now))
 
     if state.pending_issues:
         c.executemany("""
@@ -391,15 +458,11 @@ def main():
                 flush(conn, state)
                 last_flush = time.time()
 
-                half_leader = state.leaders.get((RACE_ID, "Half"))
-                half_str = (
-                    f"{half_leader['runner_name']}({half_leader['elapsed_seconds']}s)"
-                    if half_leader else "none"
-                )
+                race_counts = {r: len(s) for r, s in state.race_runners.items()}
                 print(
                     f"processed={processed} "
-                    f"half_leader={half_str} "
-                    f"pace_ratio={dict(state.pace_ratio_counts)} "
+                    f"races={race_counts} "
+                    f"finishers={sum(len(t) for t in state.finish_times.values())} "
                     f"issues_total={state.total_issues_flagged}"
                 )
     except KeyboardInterrupt:
